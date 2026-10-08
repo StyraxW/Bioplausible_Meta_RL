@@ -8,3 +8,5 @@
 runs/
 outputs/
 data/
+results/
+.pytest_cache/
