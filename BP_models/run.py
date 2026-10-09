@@ -22,10 +22,12 @@ import numpy as np
 import torch
 
 from . import VALUERNN_DIR
-from .analysis.metrics import summarize, trial_table
+from .analysis.evaluate import evaluate_trained
+from .analysis.metrics import CONVERGENCE_THRESHOLDS, convergence_loss, summarize, trial_table
 from .baselines.ideal_observer import ideal_observer_values
 from .config import RunConfig, derive_seeds, set_override
-from .memory import TraceBank
+from .baselines.b4 import TraceBank
+from .slowmem_1 import SlowMem1
 from .tasks.sessions import OvernightBreak, SessionSchedule, SessionTask
 from .train.online import OnlineTrainer
 from model import ValueRNN  # valuernn (path set up by BP_models/__init__.py)
@@ -33,15 +35,19 @@ from model import ValueRNN  # valuernn (path set up by BP_models/__init__.py)
 REPO_DIR = os.path.dirname(VALUERNN_DIR)
 N_X = 3  # x = [cA, cB, r]
 
-MEMORIES = {
+# model.slowmem -> constructor(cfg, seed, **model.slowmem_kwargs)
+SLOWMEMS = {
     'none': None,
-    'trace_bank': lambda cfg, **kw: TraceBank(N_X, dt=cfg.dt, **kw),
+    'slowmem_1': lambda cfg, seed, **kw: SlowMem1(cfg.dt, seed=seed, **kw),
+    'trace_bank': lambda cfg, seed, **kw: TraceBank(N_X, dt=cfg.dt, **kw),
 }
 
 
 def build(cfg, seeds):
     t = cfg.task
-    task = SessionTask(nsessions=t.nsessions, cue_steps=cfg.cue_steps,
+    # train to criterion: generate the longest possible stream; training stops early
+    nsessions = cfg.train.max_blocks // 2 if cfg.train.until_converged else t.nsessions
+    task = SessionTask(nsessions=nsessions, cue_steps=cfg.cue_steps,
                        ntrials_per_block=t.ntrials_per_block,
                        ntrials_per_block_jitter=t.ntrials_per_block_jitter,
                        iti_min=t.iti_min, iti_p=t.iti_p, first_block=t.first_block,
@@ -52,13 +58,15 @@ def build(cfg, seeds):
                  if o.enabled else None)
     schedule = SessionSchedule(task, overnight=overnight)
 
-    make_memory = MEMORIES[cfg.model.memory]
-    memory = make_memory(cfg, **cfg.model.memory_kwargs) if make_memory else None
-    n_z = memory.n_out if memory is not None else 0
+    make_slowmem = SLOWMEMS[cfg.model.slowmem]
+    slowmem = (make_slowmem(cfg, seeds['slowmem'], **cfg.model.slowmem_kwargs)
+               if make_slowmem else None)
+    n_z = slowmem.n_out if slowmem is not None else 0
+    # core input [x, z]: Wx and Wz are two blocks of one input matrix
     model = ValueRNN(input_size=N_X + n_z, output_size=1, hidden_size=cfg.model.hidden_size,
                      gamma=cfg.model.gamma, recurrent_cell=cfg.model.cell)
     model.reset(seed=seeds['model'], initialization_gain=cfg.model.init_gain)
-    return task, schedule, model, memory
+    return task, schedule, model, slowmem
 
 
 def _git_commit(path):
@@ -95,35 +103,74 @@ def run_one(cfg_dict, seed, out_root, threads=1, verbose=True):
     with open(os.path.join(out_dir, 'config.json'), 'w') as f:
         json.dump(meta, f, indent=2)
 
-    task, schedule, model, memory = build(cfg, seeds)
-    trainer = OnlineTrainer(model, memory=memory, window_size=cfg.train.window_size,
+    task, schedule, model, slowmem = build(cfg, seeds)
+    trainer = OnlineTrainer(model, slowmem=slowmem, window_size=cfg.train.window_size,
                             stride=cfg.train.stride, lr=cfg.train.lr, dt=cfg.dt,
                             device=cfg.device, break_seed=seeds['breaks'],
                             record_hidden=cfg.train.record_hidden, log=log)
-    res = trainer.run(schedule)
-
     probs = task.reward_probs_per_block
+    if cfg.train.until_converged:
+        if cfg.overnight.enabled:
+            raise ValueError('train.until_converged needs a continuous stream (overnight.enabled=false)')
+
+        def stop_fn(done, offsets, delta):
+            if len(done) < 2:  # the criterion needs 4 blocks = 2 sessions
+                return False
+            last = trial_table(done[-2:], probs, offsets[-2:])
+            loss = convergence_loss(last, delta, exclude_cue=cfg.train.conv_exclude_cue)
+            log(f'after {2 * len(done)} blocks: convergence loss {loss:.5f}')
+            return loss < cfg.train.conv_threshold
+
+        res = trainer.run_continuous((task.session(i) for i in range(len(task))), stop_fn)
+    else:
+        res = trainer.run(schedule)
     table = trial_table(res['sessions'], probs, res['session_offsets'], res['V'])
     io_table = trial_table(res['sessions'], probs)
     io_table['v_cue'] = ideal_observer_values(res['sessions'], probs,
                                               hazard=1.0 / cfg.task.ntrials_per_block)
     session_loss = [float(res['window_loss'][res['window_session'] == s].mean())
                     for s in np.unique(res['window_session'])]
+    conv = convergence_loss(table, res['delta'])
+    conv_nc = convergence_loss(table, res['delta'], exclude_cue=True)
     metrics = dict(model=summarize(table), ideal_observer=summarize(io_table),
+                   blocks_trained=2 * len(res['sessions']),
+                   stopped_at_criterion=bool(res.get('stopped_early', False)),
+                   convergence_loss=conv, convergence_loss_no_cue=conv_nc,
+                   converged={str(th): conv < th for th in CONVERGENCE_THRESHOLDS},
+                   converged_no_cue={str(th): conv_nc < th for th in CONVERGENCE_THRESHOLDS},
                    session_mean_loss=session_loss, breaks=res['breaks'],
                    runtime_s=res['runtime_s'])
+
+    if cfg.test.enabled:
+        t, p = cfg.task, cfg.test.protocol
+        # 'continue': the stream goes on into the next block, the reverse of the last
+        # training block; 'reset': a new episode starting in a random block
+        last_block = res['sessions'][-1].trials[-1].block_index
+        first = 1 - last_block if p == 'continue' else t.first_block
+        test_task = SessionTask(nsessions=1, blocks_per_session=cfg.test.n_blocks(),
+                                cue_steps=cfg.cue_steps, ntrials_per_block=t.ntrials_per_block,
+                                ntrials_per_block_jitter=t.ntrials_per_block_jitter,
+                                iti_min=t.iti_min, iti_p=t.iti_p, first_block=first,
+                                seed=seeds['test'])
+        metrics['test'] = evaluate_trained(model, slowmem, trainer.optimizer, trainer.final_h,
+                                           test_task, cfg.train.window_size, cfg.train.stride,
+                                           cfg.train.lr, cfg.dt, cfg.device, protocol=p,
+                                           context=trainer.tail)
+        log('test AUROC: ' + ', '.join(f'{k} {v["auroc"]:.3f}' for k, v in metrics['test'].items()
+                                       if isinstance(v, dict)))
     with open(os.path.join(out_dir, 'metrics.json'), 'w') as f:
         json.dump(metrics, f, indent=2, default=float)
 
     arrays = {k: res[k] for k in ('V', 'delta', 'step_session', 'window_loss', 'window_session',
                                   'session_offsets')}
-    if 'hidden' in res:
-        arrays['hidden'] = res['hidden']
+    for k in ('hidden', 'Wb'):
+        if k in res:
+            arrays[k] = res[k]
     arrays.update({f'trial_{k}': v for k, v in table.items()})
     arrays['trial_v_ideal_observer'] = io_table['v_cue']
     np.savez_compressed(os.path.join(out_dir, 'arrays.npz'), **arrays)
     torch.save(dict(model=model.state_dict(),
-                    memory=memory.state_dict() if memory is not None else None),
+                    slowmem=slowmem.state_dict() if slowmem is not None else None),
                os.path.join(out_dir, 'weights.pt'))
     log(f'done in {res["runtime_s"]:.1f}s -> {out_dir}')
     log_file.close()

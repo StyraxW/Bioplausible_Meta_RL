@@ -15,3 +15,11 @@ def decay_over(tau, duration):
 def to_steps(seconds, dt):
     """Number of whole steps closest to `seconds`."""
     return int(round(seconds / dt))
+
+
+def log_spaced_taus(tau_min, tau_max, n):
+    """n time constants log-spaced from tau_min to tau_max (seconds)."""
+    if n == 1:
+        return (float(tau_min),)
+    r = math.log(tau_max / tau_min) / (n - 1)
+    return tuple(tau_min * math.exp(r * k) for k in range(n))

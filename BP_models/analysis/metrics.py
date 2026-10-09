@@ -15,7 +15,7 @@ def trial_table(sessions, reward_probs_per_block, offsets=None, V=None):
     """One row per trial. With offsets and V (per-step values from OnlineTrainer),
     adds v_cue (value at cue onset) and v_pre (value on the step before the cue)."""
     cols = {k: [] for k in ('session', 'trial', 'block', 'block_pos', 'rel_trial',
-                            'cue', 'rewarded', 'good', 'onset_step')}
+                            'cue', 'rewarded', 'good', 'onset_step', 'start_step', 'length')}
     for k, s in enumerate(sessions):
         start = 0 if offsets is None else int(offsets[k])
         for j, t in enumerate(s.trials):
@@ -28,12 +28,40 @@ def trial_table(sessions, reward_probs_per_block, offsets=None, V=None):
             cols['rewarded'].append(t.y.sum() > 0)
             cols['good'].append(reward_probs_per_block[t.cue][t.block_index] > 0.5)
             cols['onset_step'].append(start + t.iti)
+            cols['start_step'].append(start)
+            cols['length'].append(len(t))
             start += len(t)
     table = {k: np.asarray(v) for k, v in cols.items()}
     if V is not None:
         table['v_cue'] = V[table['onset_step']]
         table['v_pre'] = V[table['onset_step'] - 1]
     return table
+
+
+CONVERGENCE_THRESHOLDS = (0.0005, 0.005)  # Lee et al.: Methods text / Extended Data Fig. 1
+
+
+def convergence_loss(table, delta, n_blocks=4, n_trials=20, exclude_cue=False):
+    """Lee et al. convergence criterion: mean squared RPE over the last n_trials
+    trials of each of the last n_blocks blocks of training.
+
+    exclude_cue=False: all steps of those trials. Includes the cue-onset RPE, which
+    no model can predict (cue identity and onset are random), so it has a floor of
+    ≈ 0.02 in this task.
+    exclude_cue=True: all steps except the transition into the cue (delta at
+    onset - 1) — our reconstruction of the paper's measure (typical values ≈ 0.002).
+    """
+    blocks = list(dict.fromkeys(zip(table['session'], table['block_pos'])))  # in stream order
+    sq = []
+    for s, b in blocks[-n_blocks:]:
+        idx = np.flatnonzero((table['session'] == s) & (table['block_pos'] == b))[-n_trials:]
+        for i in idx:
+            steps = np.arange(table['start_step'][i], table['start_step'][i] + table['length'][i])
+            if exclude_cue:
+                steps = steps[steps != table['onset_step'][i] - 1]
+            d = delta[steps]
+            sq.append(d[np.isfinite(d)] ** 2)
+    return float(np.concatenate(sq).mean()) if sq else float('nan')
 
 
 def discrimination(table, mask=None, key='v_cue'):

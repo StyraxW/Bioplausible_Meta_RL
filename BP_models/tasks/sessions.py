@@ -76,9 +76,11 @@ class Break:
 
 
 class SessionTask(ValueInference):
-    """valuernn's ValueInference with one episode per session, two blocks per
-    session, and CueOffsetTrial trials (k-step cue, outcome on the next step).
+    """valuernn's ValueInference with one episode per session and CueOffsetTrial
+    trials (k-step cue, outcome on the next step).
 
+    Training sessions have two blocks (one reversal); the frozen-weight test
+    episode uses blocks_per_session=4. Blocks alternate.
     ITIs are in steps, as in valuernn (iti_min + geometric(iti_p) - 1).
     The default reward_probs_per_block is the anti-correlated task:
     block 0 = A+ B-, block 1 = A- B+.
@@ -86,7 +88,7 @@ class SessionTask(ValueInference):
     first_block: 'random' (each session starts in a random block) or a block
     index used for every session.
     """
-    def __init__(self, nsessions=12, cue_steps=2,
+    def __init__(self, nsessions=12, cue_steps=2, blocks_per_session=2,
                  ntrials_per_block=50, ntrials_per_block_jitter=0,
                  reward_probs_per_block={0: (1, 0), 1: (0, 1)},
                  iti_min=6, iti_p=0.5, first_block='random', seed=None, **kwargs):
@@ -96,7 +98,7 @@ class SessionTask(ValueInference):
                 raise TypeError(f'{k} is fixed by SessionTask')
         self.cue_steps = cue_steps  # set before super().__init__, which builds the trials
         self.seed = seed
-        super().__init__(nepisodes=nsessions, nblocks=2, nblocks_per_episode=2,
+        super().__init__(nepisodes=nsessions, nblocks=2, nblocks_per_episode=blocks_per_session,
                          ntrials_per_block=ntrials_per_block,
                          ntrials_per_block_jitter=ntrials_per_block_jitter,
                          reward_times_per_block=(cue_steps, cue_steps),

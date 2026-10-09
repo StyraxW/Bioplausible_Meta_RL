@@ -8,93 +8,101 @@ Lee, Hennig, Frelih, Gershman & Uchida (bioRxiv, 10.64898/2025.11.30.691382) sho
 
 ## Documents (source of truth)
 
-- `docs/research_plan.md` — full research plan: models, baselines, evaluation, phases, risks. Mirrors the project Google Doc; if the user says the doc changed, ask them to re-export it.
-- `docs/model_schematics.md` — layer-by-layer equations for Models 1–3.
-- **Precedence:** for Model 1, `model_schematics.md` follows the *revised* spec (cue-offset gate, jump-form event trace, explicit Oja decay) and overrides `research_plan.md` §4.1 where they differ. Differences are listed at the top of `model_schematics.md`.
+- `docs/research_plan.md` — research plan: models, baselines, evaluation, phases, risks. Mirrors the project Google Doc; if the user says the doc changed, ask them to re-export it.
+- `docs/model_schematics.md` — layer-by-layer equations for Models 1–3. For Model 1 it follows the *revised* spec and overrides `research_plan.md` §4.1 (differences listed at its top).
+- `docs/2025.11.30.691382v3.full.pdf` — the Lee et al. paper. RNN Methods on p. 26–27, Extended Data Fig. 2 legend p. 46.
 
 ## Current phase
 
-**Phase 1: Model 1.** Model order: 1 → 3 → 2 (Model 2 = Model 3's architecture with a Hebbian rule). B1/B2 are already characterized in Lee et al.; the user decided not to rerun them now.
+**Phase 1: Model 1.** Model order 1 → 3 → 2 (Model 2 = Model 3's architecture with a Hebbian rule).
 
-Done (infrastructure): session task stream; online TBPTT loop that reproduces `train_model_TBPTT` exactly (tests); overnight breaks; feedforward slow-memory interface + trace bank; metrics; B3 ideal observer; config + seed run harness. 34 tests pass (`python -m pytest tests`).
+Done: session task stream; online TBPTT loop (reproduces valuernn's `train_model_TBPTT` exactly); overnight breaks; Model 1 slow memory (`slowmem_1`); plasticity test (both protocols); train-to-criterion; metrics; B3 ideal observer; config + seed run harness. `python -m pytest tests` (63 pass).
 
-Next:
-1. Model 1 front end (`BP_models/layers/`): trial-type layer (e, off, R, y), binding layer (ȳ, Wb Hebbian + Oja, z) as a `SlowMemory`; unit-test the Wb fixed point before connecting it.
-2. Model 1 end to end: register in `run.MEMORIES`, compare with B2 (same loop, short W).
-3. Still missing, add when needed: long-ITI probes, B4, feedback memory stepping (Models 2/3), replay.
+Main result so far: **Model 1 with one-hot trial-type units at W = 1 learns to reverse without plasticity** (paper settings: converges in 16–18 blocks on 5/5 seeds, frozen AUROC 0.90–0.99), where the no-slow-memory network at short W cannot (frozen AUROC 0.00).
 
-Run: `python -m BP_models.run --seeds 0-19 --workers 10 --set train.window_size=20 name='"b2_w20"'` (results in `results/<name>/seed_<k>/`). Use `--device cuda` for W = 720.
+Open:
+1. Random trial-type units (the spec) fail: z is huge (|z| ≈ 200) and saturates the GRU. Spec's rule has fixed point Wij = E[yi ȳj]/E[yi²] and y is dense. Tested fixes (no RNN): y scaled to unit length kills context information; binary k-WTA (top-k units = 1) fixes the scale but separates contexts much worse than one-hot (0.3–1.8 vs ≈ 3) and varies by seed. Next: larger pool + small k, measure trial-type overlap.
+2. Our B1 (W = 720) converges slower than the paper's (4/20 by block 18 vs ≈ 75%; block-1 RPE² 0.065 vs ≈ 0.022). **Accepted for now (user, 2026-10-08)** — whenever a network converges, results match the paper. Matters later for the "sessions to expertise" comparison; likely an ITI or averaging difference we can't resolve without the authors' code.
+3. Model 1's inference depends on lr: at lr 0.003 it switches to a plasticity-based solution (frozen 0.85 → 0.17).
+4. Break runs need the mouse protocol: each session starts with the previous session's contingency (not implemented; `first_block` currently fixed).
+5. Not built: long-ITI probes, B4 readout, Models 2/3 (per-step stepping), replay, e-prop variant.
+
+Run: `python -m BP_models.run --config cfg.json --seeds 0-19 --workers 10 --out results` (`--set key=value` overrides; on PowerShell pass JSON-valued overrides via a config file — it strips inner quotes). `--device cuda` for W = 720.
+
+## Notes on what was tried (condensed)
+
+| What | Outcome |
+|---|---|
+| First runs: γ 0.9, lr 0.003, TF-style init, 3-step cue, ITI 6 + geom(0.5), 12 sessions with breaks | Superseded by paper settings. Model 1 random: z saturates GRU. Discrimination during training can't tell plasticity from inference → use the frozen test. |
+| Frozen test, `reset` protocol (h reset, 4 new blocks) | Stuck networks score ≈ 0.5 (paper ≈ 0); paper uses `continue` (one reversed block, state carried). Both kept. |
+| γ 0.8, lr 0.0005 (paper lr), 12 sessions | Model 1 one-hot W=1 frozen 0.97; baselines undertrained. Nothing met convergence: with γ 0.8 the unavoidable cue-onset RPE gives an all-steps floor ≈ 0.023. |
+| B1 breaks vs no breaks, 12 and 48 sessions (old timing, 5 seeds) | Suggestive at 12 sessions (3/5 vs 1/5 infer), gone at 48; inconclusive. Redo with current setup and ~20 seeds. |
+| Paper task timing, 120 / 14 blocks continuous, `continue` test | B2 frozen = 0.00 (matches paper). Model 1 one-hot W=1 0.85–0.97. Learning-on test needed windows reaching back into training (fixed; exact-continuation test). |
+| lr 0.003, stride 5 | Model 1 one-hot W=1 becomes plasticity-based (frozen 0.17). |
+| γ 0.2, 20 units (paper), train to RPE² < 0.005, max 40 blocks, stride 5 | Model 1 converges 16–18 blocks, frozen 0.90–0.99. B1/B2 never converge at stride 5 (5× fewer updates); their AUROC ≈ 1 was chance (see below). |
+| Block-order bug: `first_block='random'` per 2-block session | ~25% of block boundaries had no reversal in continuous runs (affected the three rows above). Fixed: default `first_block=0` = strict alternation. |
+| ED Fig. 2d/e replication (paper settings, stride 1, 18 blocks, 20 seeds) | Qualitative match (W=720 RPE² falls, W=20 flat; W=20 frozen 0.00 all seeds, value gap −0.33; converged W=720 reverse frozen 0.74–0.99). Quantitatively slower (open item 2). |
 
 ## Repository layout
 
 ```
 Bioplausible_Meta_RL/
   CLAUDE.md
-  docs/
-    research_plan.md
-    model_schematics.md
+  docs/                  # research plan, model schematics, Lee et al. PDF
   valuernn/              # fork of mobeets/valuernn (github.com/StyraxW/valuernn), git submodule
   BP_models/             # our package: shared infrastructure + all models
-    tasks/trials.py      # CueOffsetTrial: k-step cue, outcome on the next step; cue_offset()
+    tasks/trials.py      # CueOffsetTrial (k-step cue, outcome next step); cue_offset()
     tasks/sessions.py    # SessionTask, SessionSchedule, OvernightBreak
-    timing.py            # λ = exp(−dt/τ), overnight decay, seconds → steps
-    memory.py            # SlowMemory interface (reset/run/overnight), TraceBank
-    train/online.py      # OnlineTrainer: sliding-window TBPTT over sessions + breaks
-    analysis/metrics.py  # trial table, discrimination, reversal τ
+    timing.py            # λ = exp(−dt/τ), overnight decay, seconds → steps, log-spaced τ
+    slowmem_1.py         # Model 1 slow memory: trial-type layer + Hebbian binding -> z
+    train/online.py      # OnlineTrainer: run (sessions + breaks), run_continuous (stop early)
+    analysis/metrics.py  # trial table, discrimination, reversal τ, convergence loss
+    analysis/evaluate.py # plasticity test ('continue' / 'reset'), AUROC
     baselines/ideal_observer.py  # B3
-    config.py            # RunConfig (task/overnight/model/train), derived seeds
-    run.py               # CLI harness, MEMORIES registry
-    layers/, models/     # Model 1–3 components (planned)
+    baselines/b4.py      # TraceBank (B4 readout not built yet)
+    config.py            # RunConfig (task/overnight/model/train/test), derived seeds
+    run.py               # CLI harness, SLOWMEMS registry
   tests/                 # pytest, run from repo root
   results/               # run outputs (git-ignored)
 ```
 
 `BP_models` imports the fork's modules as top-level names (`tasks.inference`, `model`, `train_bptt`); `BP_models/__init__.py` puts `valuernn/` on `sys.path`. Run code and tests from the repo root.
 
+## Current defaults (`config.py`) = Lee et al. settings
+
+- **Core:** valuernn `ValueRNN`, GRU, **20 units**, PyTorch default init (`init_gain=0`), V = wᵀh + b0. `model.cell='RNN'` gives the spec's vanilla RNN.
+- **Learning:** semi-gradient TD(0), **γ = 0.2** (paper Methods; `main_jaeeon.py` has 0.8), Adam amsgrad **lr 0.0005**, sliding window W, stride 1 (paper: every step). **"W = 1" = `window_size=2`** (one TD transition; stride must be < window).
+- **Task (paper code):** cue 1 step, outcome on the next step, ITI 5 + geometric(0.8) − 1 steps (trial ≈ 7.25 steps; W = 720 ≈ 100 trials), 50-trial blocks, anti-correlated deterministic rewards, `first_block=0` (strict alternation in a continuous stream). dt = 0.5 s (only matters for slow-memory time constants and breaks).
+- **Paper training:** 18 blocks continuous (`task.nsessions=9`, `overnight.enabled=false`). Train-to-criterion: `train.until_converged` — stop when mean RPE² (all steps, last 20 trials of each of the last 4 blocks) < 0.005 (ED Fig. 2; the Methods text's 0.0005 looks like a typo), max `train.max_blocks` = 40.
+- **Plasticity test** (`test.protocol`): `'continue'` (paper, default) — stream continues into one reversed block; frozen = learning rate 0, windows keep recomputing; learning on = windows reach back into training (exact continuation). `'reset'` — h and slow traces reset, 4 new blocks. Reports frozen, learning-on, and (Model 1) RNN-only-frozen AUROC of cue-onset value, CS+ vs CS−, plus per-trial values for ROC plots. **Only interpret AUROC for converged networks**: an unlearned network with a tiny fixed cue bias scores 0 or 1 on one block by chance; check the value gap too.
+- **Model 1 (`slowmem_1`):** τe 1.5 s, τb 15 s, ηb 0.05; `trial_types='onehot'` (4 units) or `'random'` (50 units, spec). Wb frozen in the frozen test.
+
 ## Findings about valuernn (from inspection)
 
-- `train_model_TBPTT` slides a window ending at every step (stride 1): each call runs `nn.GRU` over the whole window (cuDNN), loss = mean TD error over the window, one Adam step. Each transition is trained ~W times; cost ∝ W per step.
-- h is detached at `train_bptt.py:120` (`hs[stride-1].detach()`), i.e. the state one stride into the window, computed with pre-update weights; h0 resets to zeros each episode.
-- Core is `nn.GRU` by default; `recurrent_cell='RNN'` gives the spec's vanilla tanh RNN with no fork edits.
-- `V = wᵀh + b0`; target `y[t+1] + γ·V(t+1).detach()` (semi-gradient TD(0)) = spec's δ shifted by one index. γ is not fixed in the code (0.8–0.93 in scripts).
-- No `.cuda()`, but task classes always return CPU tensors and `quick_train.py` crashes on GPU; move batches to the device in our code.
-- `get_itis` uses the global `np.random`, so `ValueInference(seed=)` does not fix ITIs. `SessionTask` seeds it (state saved and restored).
+- `train_model_TBPTT` slides a window ending at every `stride`-th step; each call runs `nn.GRU` over the window (cuDNN), loss = mean TD error over the window, one Adam step. h0 for the next window = `hs[stride-1].detach()` (pre-update weights); h0 = 0 each episode.
+- Target `y[t+1] + γ·V(t+1).detach()` = spec's δ shifted by one index.
+- Task classes return CPU tensors; `quick_train.py` crashes on GPU. `get_itis` uses the global `np.random` (`SessionTask` seeds it and restores the state).
 
-## Design decisions (already agreed)
+## Design decisions (agreed)
 
-- **The valuernn fork stays untouched** except for compatibility/bug fixes. It provides baselines B1 (W = 720) and B2 (short window, no slow memory); editing its internals would break those comparisons. New code goes in `BP_models/` and imports from `valuernn`.
-- **Reuse** valuernn's task generation and TBPTT semantics; extend by subclassing, don't rewrite.
-- **Model 1 = front end + existing core.** The trial-type and binding layers turn x(t) into z(t). Feed the core RNN `[x, z]` as its input, so Wx and Wz are two blocks of one input matrix. Model 1 vs B2 then differs only by the front end.
-- **Hebbian state lives outside autograd.** `e`, `ȳ`, `Wb` are registered buffers updated under `torch.no_grad()`. They persist across TBPTT cuts and across sessions (overnight: traces decay analytically by `exp(−T/τ)`; `Wb` persists). `z` enters the RNN **detached**: gradients train Wz, never Wb.
-- Slow state (Hebbian, traces, eligibility) advances **once per real timestep**, never once per window recomputation. For Model 1 the front end does not depend on h, so z can be computed in one streaming per-step pass and the windows slice `[x, z]` (no Wb lag).
-- **Core: GRU** (comparable to B1/B2). Vanilla RNN available as a variant (`model.cell='RNN'`).
-- **dt = 0.5 s** (configurable). Cue = 1.5 s = 3 steps. ITIs stay in steps (valuernn: `iti_min=6`, `iti_p=0.5`). Sessions ≈ 1,100 steps; W = 720 gives ~380 windows per session vs ~1,100 for short W (fewer updates for B1 under session cuts).
-- **γ = 0.9 is PROVISIONAL** (from `jaeeon_small.py`); bioRxiv was unreachable. Confirm from the paper's Methods.
-- **Seeds:** run seed → independent task / model-init / break-noise seeds (`config.derive_seeds`).
-- **Recording is online:** V(t), h(t) from the first window where t is newest; δ(t) from the window that first contains t+1.
-- **Reversal τ:** per-session fits use one point per trial and are often nan; use `tau_pooled` (groups of 4 sessions). τ ≈ 0.22 (`TAU_STEP`) means "switch within one trial".
-
-## Task stream (shared by all models)
-
-- Inputs `x(t) = [cA(t), cB(t), r(t)]`; trial = ITI → cue (`task.cue_duration` = 1.5 s, the paper's odor; 3 steps at dt = 0.5) → outcome on the step right after cue offset.
-- `off(t) = max(0, c(t−1) − c(t))`, the cue-offset pulse, computed from c. It marks the outcome step on every trial (rewarded or omitted).
-- Sessions: two blocks, one reversal. ~12 sessions.
-- **Overnight break = a separate stream event, not a long ITI.** No TD learning during it; TBPTT window cut; traces decay analytically by `exp(−T/τ)`; weights persist; RNN state (default `reset`): `relax` (silent steps for the full duration, `round(T/dt)` ≈ 76,800 at 16 h / 0.75 s, no learning; log the final ‖Δh‖ per step and the drift after step 300; cost ~1 s CPU, ~0.03 s GPU; on GPU run it in chunks of ≤16384 steps, since cuDNN rejects a single sequence somewhere between 32,768 and 65,536 steps), `reset` (new random low-power state h = σ·N(0, I), σ = 0.1, seeded; not a fixed point — silent-input dynamics need not have an attracting one), or `carry` — log which. Breaks are optional (`overnight=None` → sessions back to back, no cut). Optional replay during breaks is a separate condition.
-- Long-ITI-break probes (37.5–300 s) are in-session: real silent steps, learning on.
+- **valuernn fork stays untouched** except compatibility fixes (ask first). New code in `BP_models/`, reuse by subclassing.
+- **Model 1 = front end + existing core:** core input `[x, z]` (Wx and Wz are blocks of one matrix); z enters detached (TD trains Wz, never Wb).
+- **Slow memory is separate per model** (`slowmem_1.py`, `slowmem_2.py`, `slowmem_3.py`); the loop has a model-specific branch. Slow state advances **once per real step**, never per window recomputation. x-driven memories (SlowMem1, TraceBank) expose `advance(X)`; z precomputed per session.
+- **Overnight break = separate stream event, not a long ITI:** no learning, window cut, traces decay by exp(−T/τ), weights persist. h policy (default `reset` = h = 0.1·N(0, I), seeded from its own seed; `relax` = silent input for the full duration, chunked ≤16384 steps on GPU (cuDNN limit); `carry`). Long-ITI probes are in-session real silent steps.
+- **Seeds:** run seed → independent task / model / break / slow-memory / test seeds (`config.derive_seeds`).
+- **Recording is online:** V(t), h(t) from the first window where t is newest.
 
 ## Environment
 
-- Windows 11, PowerShell, VS Code. Conda env **`MetaRL`**, Python **3.12**.
-- PyTorch **2.14.1+cu130** on an **RTX 5070 Ti** (16 GB, Blackwell, sm_120). Do not install CUDA 12.x builds; they lack Blackwell kernels.
-- numpy/scipy use **OpenBLAS** (switched from MKL: MKL's `libiomp5md.dll` clashed with torch's). Don't reinstall MKL numpy.
-- Install with `python -m pip ...` (never bare `pip`). Torch came from `--index-url https://download.pytorch.org/whl/cu130`.
-- Code must be **device-agnostic** (`device` argument, no hard-coded `.cuda()`).
-- Measured (H = 50, ms per TBPTT window): GPU 3.2 (W = 50) / 3.5 (W = 720); CPU 1 thread ~5.5 / ~55. Use the GPU for B1; run short-window models as single-thread CPU processes (`torch.set_num_threads(1)`), seeds in parallel.
-- Evaluation needs ≥20 seeds per model: design runs around a seed argument from the start.
+- Windows 11, PowerShell, VS Code. Conda env **`MetaRL`** (Python 3.12) at `C:\Users\wangx\.conda\envs\MetaRL\python.exe`; conda not on PATH.
+- PyTorch **2.14.1+cu130** on an **RTX 5070 Ti** (Blackwell, sm_120). Don't install CUDA 12.x builds.
+- numpy/scipy use **OpenBLAS** (MKL's `libiomp5md.dll` clashed with torch's). Don't reinstall MKL numpy.
+- Install with `python -m pip ...`. Torch from `--index-url https://download.pytorch.org/whl/cu130`.
+- Device-agnostic code. GPU for W = 720; short windows as single-thread CPU processes (`--workers`), seeds in parallel.
+- Evaluation needs ≥ 20 seeds per model.
 
 ## Conventions
 
-- Every run is reproducible from a config + seed. Log hyperparameters with results.
-- Keep time constants in seconds and convert with dt: `λ = exp(−dt/τ)`.
-- Report all tasks/conditions tried, including failures (fairness rule, research_plan §6.5).
-- Ask before changing anything in `valuernn/` beyond compatibility fixes.
+- Every run is reproducible from a config + seed; configs and git commits are logged with results.
+- Time constants in seconds, converted with dt: `λ = exp(−dt/τ)`.
+- Report all tasks/conditions tried, including failures (research_plan §6.5).

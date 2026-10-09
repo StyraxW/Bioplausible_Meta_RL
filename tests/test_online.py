@@ -8,7 +8,8 @@ import torch
 import BP_models  # noqa: F401
 from model import ValueRNN
 from train_bptt import train_model_TBPTT
-from BP_models.memory import TraceBank
+from BP_models.baselines.b4 import TraceBank
+from BP_models.slowmem_1 import SlowMem1
 from BP_models.tasks.sessions import OvernightBreak, SessionSchedule, SessionTask
 from BP_models.train.online import OnlineTrainer
 
@@ -128,13 +129,13 @@ def test_reset_noise_independent_of_task_and_init():
     assert r1['h_norm_after'] == r2['h_norm_after']
 
 
-def test_memory_advances_once_per_step_and_decays_overnight():
+def test_trace_bank_advances_once_per_step_and_decays_overnight():
     task = SessionTask(nsessions=2, ntrials_per_block=4, seed=10)
     dt, taus = 0.5, (1.0, 20.0)
     mem = TraceBank(3, taus, dt)
     model = make_model(input_size=3 + mem.n_out)
     spec = OvernightBreak(duration=10.0, h_policy='carry')
-    ours_train(model, task, spec, 15, 1, memory=mem, dt=dt)
+    ours_train(model, task, spec, 15, 1, slowmem=mem, dt=dt)
 
     # reference: the same traces computed directly on the stream
     s = np.zeros((2, 3))
@@ -147,8 +148,74 @@ def test_memory_advances_once_per_step_and_decays_overnight():
     assert np.allclose(mem.s.numpy(), s, atol=1e-5)
 
 
-def test_feedback_memory_rejected():
-    mem = TraceBank(3, (1.0,), 0.5)
-    mem.feedforward = False
+def test_slowmem_1_advances_once_per_step_through_the_loop():
+    # W = 15, stride 1: every step is recomputed ~15 times by the windows, but
+    # Model 1's Hebbian state must advance exactly once per real step
+    task = SessionTask(nsessions=3, ntrials_per_block=6, seed=11)
+    spec = OvernightBreak(duration=600.0, h_policy='reset')
+    mem = SlowMem1(0.5, seed=2)
+    model = make_model(input_size=3 + mem.n_out)
+    res = ours_train(model, task, spec, 15, 1, slowmem=mem, dt=0.5)
+
+    ref = SlowMem1(0.5, seed=2)
+    for k in range(3):
+        ref.advance(task.session(k).X)
+        assert np.allclose(res['Wb'][k], ref.Wb.numpy())  # Wb recorded at each session end
+        if k < 2:
+            ref.overnight(600.0)
+    assert torch.allclose(mem.Wb, ref.Wb) and torch.allclose(mem.ybar, ref.ybar)
+    assert mem.Wb.abs().sum() > 0
+    assert res['Wb'].shape == (3, mem.n_y, mem.n_y)
+
+
+def test_slowmem_1_z_is_detached_input_only():
+    # gradients reach the core's z input weights (Wz), never Wb
+    task = SessionTask(nsessions=1, ntrials_per_block=6, seed=12)
+    mem = SlowMem1(0.5, seed=3)
+    model = make_model(input_size=3 + mem.n_out)
+    wz_before = model.rnn.weight_ih_l0[:, 3:].detach().clone()
+    ours_train(model, task, None, 15, 1, slowmem=mem, dt=0.5)
+    assert not any(b.requires_grad for b in mem.buffers())
+    assert (model.rnn.weight_ih_l0[:, 3:] - wz_before).abs().max() > 0
+
+
+@pytest.mark.parametrize('use_slowmem,W,stride', [(False, 40, 1), (True, 40, 1), (False, 300, 5),
+                                                  (True, 2, 1)])
+def test_run_continuous_equals_run(use_slowmem, W, stride):
+    # session-by-session continuous training must equal one uninterrupted run
+    task = SessionTask(nsessions=3, ntrials_per_block=6, cue_steps=1, seed=13)
+
+    def trained(method):
+        sm = SlowMem1(0.5, trial_types='onehot') if use_slowmem else None
+        m = make_model(input_size=3 + (sm.n_out if sm else 0))
+        tr = OnlineTrainer(m, slowmem=sm, window_size=W, stride=stride, dt=0.5, log=None)
+        if method == 'run':
+            res = tr.run(SessionSchedule(task, overnight=None))
+        else:
+            res = tr.run_continuous(task.session(i) for i in range(3))
+        return m, sm, tr, res
+
+    a, sa, ta, ra = trained('run')
+    b, sb, tb, rb = trained('continuous')
+    assert_same_weights(a, b)
+    assert np.allclose(ra['V'], rb['V'], atol=1e-6)
+    assert np.allclose(ra['delta'], rb['delta'], atol=1e-6, equal_nan=True)
+    # same undefined steps as the uninterrupted run (the end, after the last window)
+    assert np.array_equal(np.isnan(ra['delta']), np.isnan(rb['delta']))
+    assert torch.allclose(ta.final_h, tb.final_h, atol=1e-6)
+    if use_slowmem:
+        assert torch.equal(sa.Wb, sb.Wb) and np.array_equal(ra['Wb'], rb['Wb'])
+
+
+def test_run_continuous_stops_early():
+    task = SessionTask(nsessions=5, ntrials_per_block=4, cue_steps=1, seed=14)
+    tr = OnlineTrainer(make_model(), window_size=10, dt=0.5, log=None)
+    res = tr.run_continuous((task.session(i) for i in range(5)),
+                            stop_fn=lambda done, off, d: len(done) == 2)
+    assert res['stopped_early'] and len(res['sessions']) == 2
+    assert len(res['V']) == sum(len(task.session(i).X) for i in range(2))
+
+
+def test_unsupported_slowmem_rejected():
     with pytest.raises(NotImplementedError):
-        OnlineTrainer(make_model(input_size=6), memory=mem, log=None)
+        OnlineTrainer(make_model(input_size=6), slowmem=torch.nn.Linear(3, 3), log=None)
